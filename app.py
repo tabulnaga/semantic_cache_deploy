@@ -389,17 +389,22 @@ def _llm_check_filter_match(question: str, sql_filter_values: set) -> dict:
     
     Returns: {"match": True/False, "extracted_value": "the value from question"}
     """
-    # Fast path: check if any filter value appears directly in the question
+    # Fast path: check if any filter value appears as a WHOLE WORD in the question.
+    # We match on word boundaries (not raw substring) so short values like "ai"
+    # don't falsely match inside unrelated words like "domain", "email", "training".
     q_lower = question.lower()
+    q_words = set(re.findall(r'[a-zA-Z0-9]+', q_lower))
     for val in sql_filter_values:
-        if val in q_lower:
-            return {"match": True, "extracted_value": val, "method": "substring_match"}
-    
-    # Check reverse: if any word in the question contains a filter value as substring
-    q_words = re.findall(r'[a-zA-Z]+', q_lower)
+        if val in q_words:
+            return {"match": True, "extracted_value": val, "method": "whole_word_match"}
+
+    # Reverse check: a question word that CONTAINS a filter value as a substring
+    # (e.g. "cybersecurity" contains "security", "fintech" contains "tech").
+    # Only allow this for filter values of length >= 4, so 2-3 char values like
+    # "ai", "ml", "ar" must match as whole words and never match incidentally.
     for word in q_words:
         for val in sql_filter_values:
-            if val in word:
+            if len(val) >= 4 and val in word:
                 return {"match": True, "extracted_value": word, "method": "word_contains_filter"}
     
     # LLM extraction: ask the model what specific filter value the user is asking about
