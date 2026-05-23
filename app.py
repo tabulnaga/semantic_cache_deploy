@@ -376,6 +376,96 @@ def _extract_like_values_from_sql(sql: str) -> set:
     return values
 
 
+def _llm_check_filter_match(question: str, sql_filter_values: set) -> dict:
+    """
+    Use LLM to extract the filter/domain value from the user's question,
+    then check if it matches any of the cached SQL's filter values.
+    
+    Handles both exact matches and semantic equivalents:
+    - "IoT" matches {'iot'} ✓ (exact)
+    - "Healthcare" matches {'healthcare'} ✓ (exact)  
+    - "medical" does NOT match {'healthcare'} ✗ (different keyword)
+    - "cybersecurity" matches {'security'} ✓ (contains substring)
+    
+    Returns: {"match": True/False, "extracted_value": "the value from question"}
+    """
+    # Fast path: check if any filter value appears directly in the question
+    q_lower = question.lower()
+    for val in sql_filter_values:
+        if val in q_lower:
+            return {"match": True, "extracted_value": val, "method": "substring_match"}
+    
+    # Check reverse: if any word in the question contains a filter value as substring
+    q_words = re.findall(r'[a-zA-Z]+', q_lower)
+    for word in q_words:
+        for val in sql_filter_values:
+            if val in word:
+                return {"match": True, "extracted_value": word, "method": "word_contains_filter"}
+    
+    # LLM extraction: ask the model what specific filter value the user is asking about
+    if not OPENAI_API_KEY:
+        # No API key — fall back to substring check only (already done above)
+        return {"match": False, "extracted_value": None, "method": "no_api_key"}
+    
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        
+        filter_list = ", ".join(sorted(sql_filter_values))
+        
+        resp = client.chat.completions.create(
+            model=SIGNATURE_MODEL,
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You extract the specific domain/category/filter value from a user's question. "
+                        "Return ONLY a JSON object with one field: \"value\" containing the extracted keyword. "
+                        "Examples:\n"
+                        "- 'tell me startups in Healthcare domain' → {\"value\": \"healthcare\"}\n"
+                        "- 'show me IoT companies' → {\"value\": \"iot\"}\n"
+                        "- 'list medical startups' → {\"value\": \"medical\"}\n"
+                        "- 'companies founded after 2020' → {\"value\": \"2020\"}\n"
+                        "- 'startups with funding over 5M' → {\"value\": \"5000000\"}\n"
+                        "If no specific filter value is found, return {\"value\": null}"
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"Question: {question}\n\nExtract the filter value."
+                }
+            ],
+            response_format={"type": "json_object"},
+            timeout=10,
+        )
+        
+        content = resp.choices[0].message.content
+        parsed = json.loads(content)
+        extracted = parsed.get("value")
+        
+        if not extracted:
+            # LLM couldn't extract a value — no filter intent, allow the hit
+            return {"match": True, "extracted_value": None, "method": "no_filter_intent"}
+        
+        extracted_lower = str(extracted).strip().lower()
+        
+        # Check if extracted value matches any SQL filter value
+        for val in sql_filter_values:
+            if val == extracted_lower:
+                return {"match": True, "extracted_value": extracted_lower, "method": "llm_exact_match"}
+            if val in extracted_lower or extracted_lower in val:
+                return {"match": True, "extracted_value": extracted_lower, "method": "llm_substring_match"}
+        
+        # No match found
+        return {"match": False, "extracted_value": extracted_lower, "method": "llm_mismatch"}
+        
+    except Exception as e:
+        print(f"_llm_check_filter_match error: {e}")
+        # On LLM error, fall back to the fast substring check (already done above, returned False)
+        return {"match": False, "extracted_value": None, "method": f"llm_error:{e}"}
+
+
 def _lookup_cached_sql(question: str) -> Optional[str]:
     """
     Run the full cache lookup pipeline (semantic → reranker → signature).
@@ -842,90 +932,55 @@ def check_cache_endpoint():
                     "rejected_reason": f"reranker_error:{e}",
                 }), 200
 
-        # 3) Filter-signature gate (WHERE-only) - same as Beam
+        # 3) Filter-signature gate (WHERE-only) - unified approach
+        #    Uses LLM to extract filter values from SQL, then checks if question matches
         if ENABLE_SIGNATURE:
             try:
                 cached_prompt = chosen.get("prompt", "")
                 cached_sql = chosen.get("response", "")
-                meta = load_meta(cached_prompt)
-                cached_f_hash = (meta or {}).get("filter_signature_hash")
+                chosen_distance = float(chosen.get("vector_distance", 0.0))
 
-                # AUTO-GENERATE signature hash from SQL if missing
-                if not cached_f_hash and cached_sql:
-                    sql_sig = {"table": SIGNATURE_TABLE, "filters": _extract_filters_from_sql(cached_sql)}
-                    sql_sig = canonicalize_filter_sig(sql_sig)
-                    if sql_sig.get("filters"):
-                        cached_f_hash = filter_signature_hash(sql_sig)
-                        store_filter_signature_hash(cached_prompt, cached_f_hash, TTL_SECONDS)
-                        print("LOOKUP: Auto-generated signature hash for cached entry")
-
-                if not cached_f_hash:
-                    # No equality filters found — fall back to LIKE value check
+                # Near-exact semantic match (distance < 0.05) — trust it, skip filter check
+                if chosen_distance < 0.05:
+                    print(f"LOOKUP: Near-exact match (dist={chosen_distance:.4f}), skipping filter check")
+                else:
+                    # Extract ALL filter values from cached SQL (both LIKE and equality)
+                    equality_filters = _extract_filters_from_sql(cached_sql)
                     like_values = _extract_like_values_from_sql(cached_sql)
-                    if like_values:
-                        chosen_distance = float(chosen.get("vector_distance", 0.0))
-                        if chosen_distance < 0.05:
-                            # Near-exact match — trust semantic similarity
-                            print(f"LOOKUP: Near-exact match (dist={chosen_distance:.4f}), skipping LIKE check")
+
+                    # Combine all filter values into one set
+                    all_filter_values = set()
+                    for f in equality_filters:
+                        val = f.get("value", "")
+                        if isinstance(val, list):
+                            all_filter_values.update(v for v in val if v)
+                        elif val:
+                            all_filter_values.add(val)
+                    all_filter_values.update(like_values)
+
+                    if all_filter_values:
+                        # Use LLM to extract what domain/filter value the user is asking about
+                        filter_match = _llm_check_filter_match(question, all_filter_values)
+                        
+                        if not filter_match["match"]:
+                            print(f"LOOKUP: Filter mismatch — sql_filters={all_filter_values}, "
+                                  f"question_intent='{filter_match.get('extracted_value', '?')}' — REJECTED")
+                            return jsonify({
+                                "success": True,
+                                "found": False,
+                                "question": question,
+                                "cached_question": cached_prompt,
+                                "sql": cached_sql,
+                                "vector_distance": vector_distance,
+                                "cosine_similarity": cosine_sim,
+                                "reranker_distance": reranker_distance,
+                                "rejected_reason": f"filter_value_mismatch:sql_has={all_filter_values},question_has={filter_match.get('extracted_value', '?')}",
+                            }), 200
                         else:
-                            q_lower = question.lower()
-                            if not any(v in q_lower for v in like_values):
-                                print(f"LOOKUP: LIKE keyword mismatch — sql has {like_values}, "
-                                      f"question='{question[:50]}' — REJECTED")
-                                return jsonify({
-                                    "success": True,
-                                    "found": False,
-                                    "question": question,
-                                    "cached_question": cached_prompt,
-                                    "sql": cached_sql,
-                                    "vector_distance": vector_distance,
-                                    "cosine_similarity": cosine_sim,
-                                    "reranker_distance": reranker_distance,
-                                    "rejected_reason": f"like_keyword_mismatch:sql_has={like_values}",
-                                }), 200
-                            else:
-                                print(f"LOOKUP: LIKE keyword match — {like_values} found in question")
+                            print(f"LOOKUP: Filter match confirmed — {filter_match.get('extracted_value')} matches {all_filter_values}")
                     else:
-                        # No equality filters AND no LIKE filters — trust semantic + reranker
+                        # No filters in SQL at all — trust semantic + reranker
                         print("LOOKUP: No filters in SQL, trusting semantic + reranker")
-
-                columns_from_sql = [f["column"] for f in _extract_filters_from_sql(cached_sql)]
-                q_sig = build_filter_signature(question, columns_from_sql)
-                q_hash = filter_signature_hash(q_sig)
-
-                # Safety: if cached SQL has filters but incoming question produces none,
-                # the question is asking something broader — reject to avoid wrong data
-                if cached_f_hash and not q_sig.get("filters"):
-                    print("LOOKUP: Rejected - cached entry has filters but question implies none")
-                    return jsonify({
-                        "success": True,
-                        "found": False,
-                        "question": question,
-                        "cached_question": cached_prompt,
-                        "sql": cached_sql,
-                        "vector_distance": vector_distance,
-                        "cosine_similarity": cosine_sim,
-                        "reranker_distance": reranker_distance,
-                        "rejected_reason": "question_has_no_filter_intent",
-                    }), 200
-
-                print(f"LOOKUP: Signature check - cached={cached_f_hash[:16]}... "
-                      f"query={q_hash[:16]}... match={q_hash == cached_f_hash}")
-
-                if q_hash != cached_f_hash:
-                    return jsonify({
-                        "success": True,
-                        "found": False,
-                        "question": question,
-                        "cached_question": cached_prompt,
-                        "sql": cached_sql,
-                        "vector_distance": vector_distance,
-                        "cosine_similarity": cosine_sim,
-                        "reranker_distance": reranker_distance,
-                        "signature_hash": cached_f_hash,
-                        "signature_match": False,
-                        "rejected_reason": "filter_signature_mismatch",
-                    }), 200
 
                 # All checks passed!
                 print("LOOKUP: HIT - found matching cached entry")
