@@ -376,48 +376,169 @@ def _extract_like_values_from_sql(sql: str) -> set:
     return values
 
 
-def _llm_check_filter_match(question: str, sql_filter_values: set) -> dict:
+def _extract_sql_intent(sql: str) -> str:
     """
-    Use LLM to extract the filter/domain value from the user's question,
-    then check if it matches any of the cached SQL's filter values.
-    
-    Handles both exact matches and semantic equivalents:
-    - "IoT" matches {'iot'} ✓ (exact)
-    - "Healthcare" matches {'healthcare'} ✓ (exact)  
-    - "medical" does NOT match {'healthcare'} ✗ (different keyword)
-    - "cybersecurity" matches {'security'} ✓ (contains substring)
-    
-    Returns: {"match": True/False, "extracted_value": "the value from question"}
-    """
-    # Fast path: check if any filter value appears as a WHOLE WORD in the question.
-    # We match on word boundaries (not raw substring) so short values like "ai"
-    # don't falsely match inside unrelated words like "domain", "email", "training".
-    q_lower = question.lower()
-    q_words = set(re.findall(r'[a-zA-Z0-9]+', q_lower))
-    for val in sql_filter_values:
-        if val in q_words:
-            return {"match": True, "extracted_value": val, "method": "whole_word_match"}
+    Determine the INTENT (what kind of information is requested) from cached SQL.
+    Returns one of: 'count', 'aggregate', 'list'.
 
-    # Reverse check: a question word that CONTAINS a filter value as a substring
-    # (e.g. "cybersecurity" contains "security", "fintech" contains "tech").
-    # Only allow this for filter values of length >= 4, so 2-3 char values like
-    # "ai", "ml", "ar" must match as whole words and never match incidentally.
-    for word in q_words:
+    - 'count'     : SELECT COUNT(...) as the main projection
+    - 'aggregate' : uses SUM/AVG/MIN/MAX, or GROUP BY with an aggregate function
+    - 'list'      : plain column projection (default)
+
+    This is a regex/keyword check — no LLM call.
+    """
+    if not sql:
+        return "list"
+    s = " ".join(sql.replace("\n", " ").split()).lower()
+
+    # Look at the projection between SELECT and FROM
+    m = re.search(r"\bselect\b(.*?)\bfrom\b", s, flags=re.IGNORECASE)
+    projection = m.group(1) if m else s
+
+    # GROUP BY with any aggregate → aggregate breakdown (check before plain count)
+    if "group by" in s and re.search(r"\b(count|sum|avg|min|max)\s*\(", s):
+        return "aggregate"
+
+    # COUNT in the projection (no group by) → single counting intent
+    if re.search(r"\bcount\s*\(", projection):
+        return "count"
+
+    # Other aggregates in the projection → aggregate intent
+    if re.search(r"\b(sum|avg|average|min|max|median)\s*\(", projection):
+        return "aggregate"
+
+    # Default: listing rows/columns
+    return "list"
+
+
+def _extract_group_by_columns(sql: str) -> list:
+    """
+    Extract the GROUP BY columns (the aggregation axis) from SQL.
+    Returns a sorted list of normalized column names, or [] if no GROUP BY.
+
+    Examples:
+    - '... GROUP BY country'                  -> ['country']
+    - '... GROUP BY primary_industry, year'   -> ['primary_industry', 'year']
+    - '... GROUP BY ALL'                       -> ['__all__']  (DuckDB shorthand)
+    - no GROUP BY                              -> []
+
+    Strips table prefixes (cb.country -> country) and ignores ASC/DESC.
+    Regex only, no LLM.
+    """
+    if not sql:
+        return []
+    s = " ".join(sql.replace("\n", " ").split())
+    m = re.search(
+        r"\bgroup\s+by\b(.*?)(\border\s+by\b|\bhaving\b|\blimit\b|\bwindow\b|$)",
+        s, flags=re.IGNORECASE
+    )
+    if not m:
+        return []
+    clause = m.group(1).strip()
+    if not clause:
+        return []
+
+    # DuckDB 'GROUP BY ALL' — treat as a single sentinel so two ALL queries match
+    if clause.lower().strip() == "all":
+        return ["__all__"]
+
+    cols = []
+    for raw in clause.split(","):
+        part = raw.strip().lower()
+        # Drop trailing ASC/DESC and surrounding quotes/parens
+        part = re.sub(r"\s+(asc|desc)$", "", part).strip(" \"'`()")
+        # Strip table alias prefix: cb.country -> country
+        if "." in part:
+            part = part.split(".")[-1]
+        if part:
+            cols.append(part)
+    return sorted(set(cols))
+
+
+def _llm_check_filter_match(question: str, sql_filter_values: set, sql_intent: str = "list",
+                            sql_group_by: list = None) -> dict:
+    """
+    Check that a question matches the cached SQL on THREE independent gates.
+    All gates must pass for a cache hit:
+
+    1. FILTER VALUE — the domain/category/value asked about must match the
+       cached SQL's WHERE filters (healthcare == healthcare, medical != healthcare).
+    2. INTENT — list / count / aggregate must match
+       ('list companies' != 'how many companies').
+    3. GROUP BY AXIS — if the cached SQL groups by some column(s), the question
+       must ask for the same breakdown ('by country' != 'by industry').
+
+    Args:
+        question: incoming user question
+        sql_filter_values: filter values from cached SQL WHERE clause
+        sql_intent: 'list' | 'count' | 'aggregate'
+        sql_group_by: list of GROUP BY columns from cached SQL ([] if none)
+
+    Returns: {"match": bool, "extracted_value", "extracted_intent",
+              "extracted_group_by", "method"}
+    """
+    if sql_group_by is None:
+        sql_group_by = []
+    q_lower = question.lower()
+
+    # --- Step A: determine the QUESTION's intent via fast keyword check ---
+    if re.search(r"\bhow many\b|\bnumber of\b|\bcount\b|\bhow much\b", q_lower):
+        q_intent = "count"
+    elif re.search(r"\b(total|sum|average|avg|maximum|minimum|highest|lowest|mean|median)\b", q_lower):
+        q_intent = "aggregate"
+    else:
+        q_intent = "list"
+
+    # Intent gate (fast). If the question groups by something, it's a breakdown,
+    # which behaves like an aggregate even if phrased as "how many ... by ...".
+    q_has_breakdown = bool(re.search(r"\b(per|by|grouped by|for each|broken down by)\b", q_lower))
+
+    if q_intent != sql_intent:
+        # Allow one nuance: cached aggregate breakdown vs "how many ... per ..."
+        if not (sql_intent == "aggregate" and q_intent == "count" and q_has_breakdown):
+            return {
+                "match": False, "extracted_value": None, "extracted_intent": q_intent,
+                "extracted_group_by": None,
+                "method": f"intent_mismatch:sql={sql_intent},question={q_intent}",
+            }
+
+    # --- Step B: GROUP BY axis gate ---
+    # If cached SQL has no GROUP BY but the question clearly asks for a breakdown
+    # ("... by country"), they don't match.
+    if not sql_group_by and q_has_breakdown:
+        return {
+            "match": False, "extracted_value": None, "extracted_intent": q_intent,
+            "extracted_group_by": "<some>",
+            "method": "group_by_mismatch:sql=none,question=breakdown",
+        }
+
+    # If cached SQL HAS a GROUP BY, we must verify the question asks for the SAME axis.
+    # Natural language axis ("by country") needs the LLM to map to a column, so we
+    # fall through to the LLM step below whenever sql_group_by is non-empty.
+    needs_llm_for_group_by = bool(sql_group_by)
+
+    # --- Step C: filter value fast path (only safe when no GROUP BY to verify) ---
+    if not needs_llm_for_group_by:
+        q_words = set(re.findall(r'[a-zA-Z0-9]+', q_lower))
         for val in sql_filter_values:
-            if len(val) >= 4 and val in word:
-                return {"match": True, "extracted_value": word, "method": "word_contains_filter"}
-    
-    # LLM extraction: ask the model what specific filter value the user is asking about
+            if val in q_words:
+                return {"match": True, "extracted_value": val, "extracted_intent": q_intent,
+                        "extracted_group_by": [], "method": "whole_word_match"}
+        for word in q_words:
+            for val in sql_filter_values:
+                if len(val) >= 4 and val in word:
+                    return {"match": True, "extracted_value": word, "extracted_intent": q_intent,
+                            "extracted_group_by": [], "method": "word_contains_filter"}
+
+    # --- Step D: LLM extraction (filter value + intent + group-by axis) ---
     if not OPENAI_API_KEY:
-        # No API key — fall back to substring check only (already done above)
-        return {"match": False, "extracted_value": None, "method": "no_api_key"}
-    
+        return {"match": False, "extracted_value": None, "extracted_intent": q_intent,
+                "extracted_group_by": None, "method": "no_api_key"}
+
     try:
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
-        
-        filter_list = ", ".join(sorted(sql_filter_values))
-        
+
         resp = client.chat.completions.create(
             model=SIGNATURE_MODEL,
             temperature=0,
@@ -425,50 +546,115 @@ def _llm_check_filter_match(question: str, sql_filter_values: set) -> dict:
                 {
                     "role": "system",
                     "content": (
-                        "You extract the specific domain/category/filter value from a user's question. "
-                        "Return ONLY a JSON object with one field: \"value\" containing the extracted keyword. "
+                        "You analyze a database question and extract three things:\n"
+                        "1. \"value\": the specific domain/category/filter value asked about (lowercase keyword)\n"
+                        "2. \"intent\": 'list' (wants rows/names), 'count' (wants a number / how many), "
+                        "or 'aggregate' (wants sum/avg/min/max/total)\n"
+                        "3. \"group_by\": a list of the column(s) the user wants results broken down BY "
+                        "(e.g. 'by country' -> [\"country\"], 'per industry' -> [\"industry\"], "
+                        "'for each year' -> [\"year\"]). Use [] if the user wants no breakdown.\n\n"
+                        "Return ONLY JSON with fields \"value\", \"intent\", \"group_by\".\n"
                         "Examples:\n"
-                        "- 'tell me startups in Healthcare domain' → {\"value\": \"healthcare\"}\n"
-                        "- 'show me IoT companies' → {\"value\": \"iot\"}\n"
-                        "- 'list medical startups' → {\"value\": \"medical\"}\n"
-                        "- 'companies founded after 2020' → {\"value\": \"2020\"}\n"
-                        "- 'startups with funding over 5M' → {\"value\": \"5000000\"}\n"
-                        "If no specific filter value is found, return {\"value\": null}"
+                        "- 'list healthcare startups' -> {\"value\":\"healthcare\",\"intent\":\"list\",\"group_by\":[]}\n"
+                        "- 'how many IoT companies' -> {\"value\":\"iot\",\"intent\":\"count\",\"group_by\":[]}\n"
+                        "- 'number of companies by country' -> {\"value\":null,\"intent\":\"count\",\"group_by\":[\"country\"]}\n"
+                        "- 'count of startups per industry' -> {\"value\":null,\"intent\":\"count\",\"group_by\":[\"industry\"]}\n"
+                        "- 'total funding by region' -> {\"value\":null,\"intent\":\"aggregate\",\"group_by\":[\"region\"]}\n"
+                        "If no filter value, use null. If no breakdown, use []."
                     )
                 },
-                {
-                    "role": "user",
-                    "content": f"Question: {question}\n\nExtract the filter value."
-                }
+                {"role": "user", "content": f"Question: {question}\n\nExtract value, intent, group_by."}
             ],
             response_format={"type": "json_object"},
             timeout=10,
         )
-        
+
         content = resp.choices[0].message.content
         parsed = json.loads(content)
         extracted = parsed.get("value")
-        
+        extracted_intent = (parsed.get("intent") or "list").strip().lower()
+        extracted_group_by = parsed.get("group_by") or []
+        # Normalize the question's group-by columns the same way as the SQL's
+        norm_q_group_by = sorted({
+            str(g).strip().lower().split(".")[-1] for g in extracted_group_by if str(g).strip()
+        })
+
+        # Gate 2 (intent) — re-check with the LLM's reading
+        if extracted_intent != sql_intent:
+            if not (sql_intent == "aggregate" and extracted_intent == "count" and norm_q_group_by):
+                return {
+                    "match": False,
+                    "extracted_value": (str(extracted).strip().lower() if extracted else None),
+                    "extracted_intent": extracted_intent, "extracted_group_by": norm_q_group_by,
+                    "method": f"llm_intent_mismatch:sql={sql_intent},question={extracted_intent}",
+                }
+
+        # Gate 3 (group-by axis) — must match the cached SQL's axis
+        sql_gb_norm = sorted(c for c in sql_group_by if c != "__all__")
+        if sql_gb_norm or norm_q_group_by:
+            # Compare as sets; if either side names an axis, they must agree.
+            # Allow loose match: question axis is contained in / contains SQL axis
+            if not _group_by_axes_match(sql_gb_norm, norm_q_group_by):
+                return {
+                    "match": False,
+                    "extracted_value": (str(extracted).strip().lower() if extracted else None),
+                    "extracted_intent": extracted_intent, "extracted_group_by": norm_q_group_by,
+                    "method": f"group_by_mismatch:sql={sql_gb_norm},question={norm_q_group_by}",
+                }
+
+        # Gate 1 (filter value)
         if not extracted:
-            # LLM couldn't extract a value — no filter intent, allow the hit
-            return {"match": True, "extracted_value": None, "method": "no_filter_intent"}
-        
+            return {"match": True, "extracted_value": None, "extracted_intent": extracted_intent,
+                    "extracted_group_by": norm_q_group_by, "method": "no_filter_intent"}
+
         extracted_lower = str(extracted).strip().lower()
-        
-        # Check if extracted value matches any SQL filter value
         for val in sql_filter_values:
             if val == extracted_lower:
-                return {"match": True, "extracted_value": extracted_lower, "method": "llm_exact_match"}
+                return {"match": True, "extracted_value": extracted_lower, "extracted_intent": extracted_intent,
+                        "extracted_group_by": norm_q_group_by, "method": "llm_exact_match"}
             if val in extracted_lower or extracted_lower in val:
-                return {"match": True, "extracted_value": extracted_lower, "method": "llm_substring_match"}
-        
-        # No match found
-        return {"match": False, "extracted_value": extracted_lower, "method": "llm_mismatch"}
-        
+                return {"match": True, "extracted_value": extracted_lower, "extracted_intent": extracted_intent,
+                        "extracted_group_by": norm_q_group_by, "method": "llm_substring_match"}
+
+        # If SQL had no filter values at all but axis+intent matched, accept.
+        if not sql_filter_values:
+            return {"match": True, "extracted_value": extracted_lower, "extracted_intent": extracted_intent,
+                    "extracted_group_by": norm_q_group_by, "method": "axis_intent_match_no_filter"}
+
+        return {"match": False, "extracted_value": extracted_lower, "extracted_intent": extracted_intent,
+                "extracted_group_by": norm_q_group_by, "method": "llm_value_mismatch"}
+
     except Exception as e:
         print(f"_llm_check_filter_match error: {e}")
-        # On LLM error, fall back to the fast substring check (already done above, returned False)
-        return {"match": False, "extracted_value": None, "method": f"llm_error:{e}"}
+        return {"match": False, "extracted_value": None, "extracted_intent": q_intent,
+                "extracted_group_by": None, "method": f"llm_error:{e}"}
+
+
+def _group_by_axes_match(sql_axis: list, question_axis: list) -> bool:
+    """
+    Decide whether two GROUP BY axes refer to the same breakdown.
+    Both are normalized lowercase column-name lists.
+
+    - Both empty            -> match (no breakdown on either side)
+    - One empty, other not   -> mismatch (one wants a breakdown, the other doesn't)
+    - Both non-empty         -> match if they share the same core column name,
+      allowing synonyms via substring (e.g. 'country' vs 'country_name',
+      'industry' vs 'primary_industry').
+    """
+    if not sql_axis and not question_axis:
+        return True
+    if bool(sql_axis) != bool(question_axis):
+        return False
+    # Both non-empty: require every question axis col to correspond to a SQL axis col
+    for q in question_axis:
+        matched = False
+        for s in sql_axis:
+            if q == s or q in s or s in q:
+                matched = True
+                break
+        if not matched:
+            return False
+    return True
 
 
 def _lookup_cached_sql(question: str) -> Optional[str]:
@@ -963,29 +1149,34 @@ def check_cache_endpoint():
                             all_filter_values.add(val)
                     all_filter_values.update(like_values)
 
-                    if all_filter_values:
-                        # Use LLM to extract what domain/filter value the user is asking about
-                        filter_match = _llm_check_filter_match(question, all_filter_values)
-                        
-                        if not filter_match["match"]:
-                            print(f"LOOKUP: Filter mismatch — sql_filters={all_filter_values}, "
-                                  f"question_intent='{filter_match.get('extracted_value', '?')}' — REJECTED")
-                            return jsonify({
-                                "success": True,
-                                "found": False,
-                                "question": question,
-                                "cached_question": cached_prompt,
-                                "sql": cached_sql,
-                                "vector_distance": vector_distance,
-                                "cosine_similarity": cosine_sim,
-                                "reranker_distance": reranker_distance,
-                                "rejected_reason": f"filter_value_mismatch:sql_has={all_filter_values},question_has={filter_match.get('extracted_value', '?')}",
-                            }), 200
-                        else:
-                            print(f"LOOKUP: Filter match confirmed — {filter_match.get('extracted_value')} matches {all_filter_values}")
+                    # Determine the cached SQL's intent and GROUP BY axis
+                    sql_intent = _extract_sql_intent(cached_sql)
+                    sql_group_by = _extract_group_by_columns(cached_sql)
+
+                    # Check filter value + intent + group-by axis against the question.
+                    filter_match = _llm_check_filter_match(question, all_filter_values, sql_intent, sql_group_by)
+
+                    if not filter_match["match"]:
+                        print(f"LOOKUP: Rejected — sql_filters={all_filter_values}, sql_intent={sql_intent}, "
+                              f"sql_group_by={sql_group_by}, method={filter_match.get('method')} — REJECTED")
+                        return jsonify({
+                            "success": True,
+                            "found": False,
+                            "question": question,
+                            "cached_question": cached_prompt,
+                            "sql": cached_sql,
+                            "vector_distance": vector_distance,
+                            "cosine_similarity": cosine_sim,
+                            "reranker_distance": reranker_distance,
+                            "sql_intent": sql_intent,
+                            "question_intent": filter_match.get("extracted_intent"),
+                            "sql_group_by": sql_group_by,
+                            "question_group_by": filter_match.get("extracted_group_by"),
+                            "rejected_reason": f"{filter_match.get('method')}:sql_filters={all_filter_values},question_value={filter_match.get('extracted_value', '?')}",
+                        }), 200
                     else:
-                        # No filters in SQL at all — trust semantic + reranker
-                        print("LOOKUP: No filters in SQL, trusting semantic + reranker")
+                        print(f"LOOKUP: Match confirmed — value={filter_match.get('extracted_value')}, "
+                              f"intent={sql_intent}, group_by={sql_group_by}, method={filter_match.get('method')}")
 
                 # All checks passed!
                 print("LOOKUP: HIT - found matching cached entry")
