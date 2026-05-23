@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: semantic-cache-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: REDIS_URL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: CACHE_NAME
+        value: semantic-cache
+      - key: CACHE_DISTANCE_THRESHOLD
+        value: "0.35"
+      - key: CACHE_TTL_SECONDS
+        value: "3600"
+      - key: ENABLE_RERANKER
+        value: "true"
+      - key: RERANKER_DISTANCE_THRESHOLD
+        value: "0.25"
+      - key: ENABLE_SIGNATURE
+        value: "false"
+      - key: SIGNATURE_MODEL
+        value: gpt-4o-mini

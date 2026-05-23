@@ -1,0 +1,32 @@
+# Web framework
+flask>=3.0.0
+gunicorn>=22.0.0
+
+# Redis client + vector search
+redis>=4.0.0
+redisvl>=0.3.0
+
+# OpenAI API (embeddings + reranker + signature)
+openai>=1.0.0
+
+# PostgreSQL driver (Supabase column loader)
+psycopg2-binary>=2.9.0
+
+# Data validation
+pydantic>=2.0.0
+
+# Environment variable loading
+python-dotenv>=1.0.0
+
+# DataFrame operations
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Progress bars
+tqdm>=4.0.0
+
+# Anthropic SDK (SQL agent - only for /query/generate)
+anthropic>=0.50.0
+
+# DuckDB (MotherDuck - only for /query/generate)
+duckdb>=1.0.0

@@ -1,0 +1,8 @@
+__pycache__
+*.pyc
+.env
+.git
+.pytest_cache
+*.zip
+venv/
+duckpocenv/
