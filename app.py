@@ -860,18 +860,34 @@ def check_cache_endpoint():
                         print("LOOKUP: Auto-generated signature hash for cached entry")
 
                 if not cached_f_hash:
-                    print("LOOKUP: Rejected - missing cached filter signature hash")
-                    return jsonify({
-                        "success": True,
-                        "found": False,
-                        "question": question,
-                        "cached_question": cached_prompt,
-                        "sql": cached_sql,
-                        "vector_distance": vector_distance,
-                        "cosine_similarity": cosine_sim,
-                        "reranker_distance": reranker_distance,
-                        "rejected_reason": "missing_cached_filter_signature_hash",
-                    }), 200
+                    # No equality filters found — fall back to LIKE value check
+                    like_values = _extract_like_values_from_sql(cached_sql)
+                    if like_values:
+                        chosen_distance = float(chosen.get("vector_distance", 0.0))
+                        if chosen_distance < 0.05:
+                            # Near-exact match — trust semantic similarity
+                            print(f"LOOKUP: Near-exact match (dist={chosen_distance:.4f}), skipping LIKE check")
+                        else:
+                            q_lower = question.lower()
+                            if not any(v in q_lower for v in like_values):
+                                print(f"LOOKUP: LIKE keyword mismatch — sql has {like_values}, "
+                                      f"question='{question[:50]}' — REJECTED")
+                                return jsonify({
+                                    "success": True,
+                                    "found": False,
+                                    "question": question,
+                                    "cached_question": cached_prompt,
+                                    "sql": cached_sql,
+                                    "vector_distance": vector_distance,
+                                    "cosine_similarity": cosine_sim,
+                                    "reranker_distance": reranker_distance,
+                                    "rejected_reason": f"like_keyword_mismatch:sql_has={like_values}",
+                                }), 200
+                            else:
+                                print(f"LOOKUP: LIKE keyword match — {like_values} found in question")
+                    else:
+                        # No equality filters AND no LIKE filters — trust semantic + reranker
+                        print("LOOKUP: No filters in SQL, trusting semantic + reranker")
 
                 columns_from_sql = [f["column"] for f in _extract_filters_from_sql(cached_sql)]
                 q_sig = build_filter_signature(question, columns_from_sql)

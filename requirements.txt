@@ -30,3 +30,6 @@ anthropic>=0.50.0
 
 # DuckDB (MotherDuck - only for /query/generate)
 duckdb>=1.0.0
+
+pytest>=7.0.0
+requests>=2.28.0
