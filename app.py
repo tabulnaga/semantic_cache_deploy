@@ -993,7 +993,6 @@ def check_cache_endpoint():
                     "vector_distance": vector_distance,
                     "cosine_similarity": cosine_sim,
                     "reranker_distance": reranker_distance,
-                    "signature_hash": cached_f_hash,
                     "signature_match": True,
                 }), 200
 
